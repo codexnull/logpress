@@ -1,0 +1,319 @@
+#!/bin/bash -e
+
+# Simple log compressor.  Looks in specified directories (and subdirectories)
+# for files named *.log older than N days and compresses them.  Runs with low
+# priority to minimize impact on other work.  Preserves original file's
+# attributes (e.g. ownership, mode, etc) as much as possible.
+
+# Process may have to be run as root in order to preserve ownership and
+# permissions, so try to limit what else may be run as root.
+export PATH=/bin:/usr/bin
+export LD_LIBRARY_PATH=
+
+# TODO add other compression options besides gzip (e.g. xz, bzip2, ...)
+
+#==============================================================================
+# CONFIGURATION
+#==============================================================================
+
+# An empty file takes up no space, just an inode.  Compressing it would make
+# it non-zero length and thus actually *increase* disk usage.
+#
+# A small file may take up just one allocation block, so compressing it would
+# do work for no space savings.
+#
+# Either way, small or empty files may be compressed for consistency.  Set
+# threshold to 0 to compress all (including empty) files, 1 to compress all
+# non-empty files, or some other byte size to compress only files that size or
+# larger.
+FILE_SIZE_THRESHOLD=$((1024 * 4))
+
+# There's no reliable way to tell if a log file is "complete", so to be safe
+# only compress files that have not been modified in more than some number of
+# days.
+FILE_AGE_THRESHOLD=30
+
+#==============================================================================
+# GLOBALS
+#==============================================================================
+
+readonly ME=$(basename $0 .sh)
+readonly VERSION="v1.0.0"
+readonly GZIP=gzip
+readonly HOST=$(uname -n)
+readonly SECS_PER_DAY=$((60 * 60 * 24))
+
+LOGDIR=/var/log
+STAMP_TIME=
+IPC_FILE=
+
+declare -i UNCOMPRESSED_SIZE=0
+declare -i COMPRESSED_SIZE=0
+
+#==============================================================================
+# FUNCTIONS
+#==============================================================================
+
+function Usage
+{
+    local ev=${1:-2}
+
+    [[ $ev -eq 0 ]] || exec >&2
+    eval cat <<USAGE
+usage: $ME [opts] <dir> [dir2 dir2 ...]
+
+opts:
+
+  -h --help             output usage or longer help messages
+  -v --version          output version number
+  -n --dry-run          log what would be compressed without actually doing it
+  -p --pidfile <path>   record pid to specified file instead of $PIDFILE
+  -l --logfile <path>   log to specified file instead of in /var/log/
+  -s --min-size <int>   specify minimum size of files to compress
+  -a --min-age <int>    specify minimum age (in days) of files to compress
+USAGE
+
+    exit $ev
+}
+
+function Info
+{
+    [[ -z $STAMP_TIME ]] || echo >&2 -n "$(date +'[%Y-%m-%dT%H:%M:%S]  ')"
+    echo >&2 "INFO  $@"
+}
+
+function Warning
+{
+    [[ -z $STAMP_TIME ]] || echo >&2 -n "$(date +'[%Y-%m-%dT%H:%M:%S]  ')"
+    echo >&2 "WARN  $@"
+    WARNINGS=1
+}
+
+function Error
+{
+    [[ -z $STAMP_TIME ]] || echo >&2 -n "$(date +'[%Y-%m-%dT%H:%M:%S]  ')"
+    echo >&2 "$ME: $@"
+    exit 1
+}
+
+function RoundBytes
+{
+    if [[ $1 -lt 1024 ]]; then
+        echo $1 bytes
+    elif [[ $1 -lt $((1024 * 1024)) ]]; then
+        echo $(( $1 / (1024) )) KiB
+    elif [[ $1 -lt $((1024 * 1024 * 1024)) ]]; then
+        echo $(( $1 / (1024 * 1024) )) MiB
+    else
+        echo $(( $1 / (1024 * 1024 * 1024) )) GiB
+    fi
+}
+
+function SaveStats
+{
+    printf "UNCOMPRESSED_SIZE=%d\nCOMPRESSED_SIZE=%d\n" \
+           $UNCOMPRESSED_SIZE $COMPRESSED_SIZE \
+        > $IPC_FILE
+}
+
+function LoadStats
+{
+    source $IPC_FILE
+}
+
+function ProcessDir
+{
+    local dir=${1:?no dir}
+
+    # the while loop body below runs in a subshell, so any updates to the stats
+    # environment variables will be lost when the subshell exits... so use the
+    # ipc file to persist them
+    SaveStats
+
+    dir=$(readlink -f $dir)
+    Info "looking for logs in $dir/"
+
+    # do a breath-first traversal... i.e. process all the logs in a directory
+    # before going into subdirectories
+    #
+    local now=$(date +%s)
+    find $dir -maxdepth 1 -type f -name '*.log' -print \
+    | while read -r path ; do
+        local IFS=:
+        local stat=( $(stat -c%s:%Y:%h $path) )
+        local size=${stat[0]}
+        local mtime=${stat[1]}
+        local nlinks=${stat[2]}
+
+        if [[ $size -lt $FILE_SIZE_THRESHOLD ]]; then
+            if [[ $size -eq 0 ]]; then
+                Warning "skipping empty file $path"
+            else
+                Warning "skipping small file $path"
+            fi
+
+            continue
+        fi
+
+        if [[ $nlinks -gt 1 ]]; then
+            Warning "skipping multiply linked file $path"
+
+            continue
+        fi
+
+        if [[ $(( (now-mtime)/SECS_PER_DAY )) -lt $FILE_AGE_THRESHOLD ]]; then
+            Warning "skipping recently modified file $path"
+
+            continue
+        fi
+
+        UNCOMPRESSED_SIZE+=$size
+
+        if [[ $DRY_RUN = YES ]]; then
+            Info "would compress file $path [$(RoundBytes $size)]" 
+        else
+            Info "compressing file $path [$(RoundBytes $size)]"
+            gzip -9 $path
+            if [[ $? -ne 0 ]]; then
+                Error "gzip exited with $?"
+                exit 1
+            fi
+
+            size=$(stat -c%s $path.gz)
+            COMPRESSED_SIZE+=$size
+        fi
+
+        SaveStats
+    done
+
+    if [[ $? -ne 0 ]]; then
+        Error "aborting due to errors"
+        exit 1
+    fi
+
+    LoadStats
+
+    find $dir -maxdepth 1 -type d -print | tail -n +2 \
+    | while read -r path ; do
+        ProcessDir "$path"
+    done
+
+    LoadStats
+
+    return 0
+}
+
+#==============================================================================
+# MAIN
+#==============================================================================
+
+DRY_RUN= LOGFILE= MIN_SIZE= MIN_AGE= PIDFILE=/var/run/$ME.pid
+
+ARGS=$(/usr/bin/getopt -n${ME:-$0} -o"hvnl:p:s:a:" -l"help,version,dry-run,logfile:,pidfile:,min-size:,min-age:" -- "$@") \
+    || exit 1
+
+eval set -- "$ARGS" ; # the eval and quotes around $ARGS are important!
+while true; do
+    case "$1" in
+        -h|--help)          Usage 0              ;;
+        -v|--version)       echo $VERSION; exit  ;;
+        -n|--dry-run)       DRY_RUN=YES  ;       ;;
+        -p|--pidfile)       PIDFILE=$2   ; shift ;;
+        -l|--logfile)       LOGFILE=$2   ; shift ;;
+        -s|--min-size)      MIN_SIZE=$2  ; shift ;;
+        -a|--min-age)       MIN_AGE=$2   ; shift ;;
+        --)                 shift        ; break ;;
+    esac
+    shift
+done
+
+if [[ -n $MIN_SIZE ]]; then
+    if [[ -n ${MIN_SIZE//[0-9]/} ]]; then
+        Error "invalid file size -- $MIN_SIZE"
+    elif [[ $MIN_SIZE -gt 1 && $MIN_SIZE -lt 1024 ]]; then
+        FILE_SIZE_THRESHOLD=$((1024 * $MIN_SIZE))
+    else
+        FILE_SIZE_THRESHOLD=$MIN_SIZE
+    fi
+fi
+
+if [[ -n $MIN_AGE ]]; then
+    if [[ -n ${MIN_AGE//[0-9]/} ]]; then
+        Error "invalid number of days -- $MIN_AGE"
+    else
+        FILE_AGE_THRESHOLD=$MIN_AGE
+    fi
+fi
+
+DIRECTORIES=()
+for DIR in "$@"; do
+    if [[ ! -d $DIR ]]; then
+        Warning "ignoring invalid directory -- $DIR"
+    else
+        DIRECTORIES+=( $DIR )
+    fi
+done
+
+if [[ ${#DIRECTORIES[*]} -eq 0 ]]; then
+    Error "no directories to search for logs"
+fi
+
+if [[ $PIDFILE = - ]]; then
+    PIDFILE=/dev/stdout
+elif [[ -e $PIDFILE && $PIDFILE != /dev/null ]]; then
+    PID=$(<$PIDFILE) || exit 1
+    Error "found $PIDFILE with pid $PID"
+else
+    trap "rm -f $PIDFILE 2>/dev/null" EXIT
+fi
+
+echo $$ > $PIDFILE
+[[ $? -eq 0 ]] || Error "unable to save pid -- $PIDFILE"
+
+if [[ -z $LOGFILE && ! $DRY_RUN ]]; then
+    DATE=$(date +"%Y%m%d")
+    LOGFILE=$LOGDIR/$ME.log
+    if [[ ! -e $LOGFILE || -h $LOGFILE ]]; then
+        ln -fs $LOGFILE.$DATE $LOGFILE
+    fi
+    LOGFILE=$LOGFILE.$DATE
+elif [[ $LOGFILE = - || $DRY_RUN ]]; then
+    LOGFILE=/dev/stdout
+fi
+
+if [[ $EUID -ne 0 ]]; then
+    Warning "may not be able to preserve all attributes when not root"
+fi
+
+exec >> $LOGFILE 2>> $LOGFILE
+
+IPC_FILE=$(mktemp /dev/shm/$ME.XXXXXXXX)
+
+echo "========================================================================"
+STAMP_TIME=YES
+Info "$ME starting on host $HOST as pid $$"
+
+if [[ $DRY_RUN = YES ]]; then
+    Warning "not actually compressing anything because of --dry-run"
+fi
+
+renice 20 $$ >/dev/null
+
+for DIR in ${DIRECTORIES[@]}; do
+    ProcessDir "$DIR"
+done
+
+if [[ $DRY_RUN = YES ]]; then
+    Info "would compress a total of" $(RoundBytes $UNCOMPRESSED_SIZE)
+elif [[ $COMPRESSED_SIZE -gt 0 ]]; then
+    Info "compressed a total of $(RoundBytes $UNCOMPRESSED_SIZE) down to" \
+         $(RoundBytes $COMPRESSED_SIZE)
+else
+    Info "no log files found to compress"
+fi
+
+rm -rf $IPC_FILE
+
+exit 0
+
+# eof
